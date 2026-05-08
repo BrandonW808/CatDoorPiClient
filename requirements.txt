@@ -1,0 +1,3 @@
+RPi.GPIO
+hx711
+python-socketio[client]
