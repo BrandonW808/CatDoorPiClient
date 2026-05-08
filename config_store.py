@@ -15,7 +15,7 @@ DEFAULTS = {
     "min_weight": -3100,
     "max_weight": -4600,
     "auto_update": True,
-    "update_check_interval": 1800,   # seconds (30 min)
+    "update_check_interval": 2400,   # seconds (30 min)
 }
 
 
