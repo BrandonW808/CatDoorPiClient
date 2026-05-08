@@ -262,12 +262,12 @@ def read_sensor(channel):
         close_timer.start()
 
 
-GPIO.add_event_detect(
-    DOOR_SENSOR,
-    GPIO.BOTH,
-    callback=read_sensor,
-    bouncetime=500,
-)
+# GPIO.add_event_detect(
+#     DOOR_SENSOR,
+#     GPIO.BOTH,
+#     callback=read_sensor,
+#     bouncetime=500,
+# )
 
 def perform_update(force_restart: bool = True) -> bool:
     """git pull; return True if anything was updated."""
@@ -296,6 +296,9 @@ def perform_update(force_restart: bool = True) -> bool:
     except Exception as exc:
         log_event("error", f"Update failed: {exc}")
         return False
+    finally:
+        # This is GUARANTEED to run, releasing the GPIO pins safely
+        clean_and_exit()
 
 
 def auto_update_loop():
@@ -380,6 +383,6 @@ while True:
         if now_t - last_status_time >= STATUS_INTERVAL:
             send_status()
             last_status_time = now_t
-
-    except (KeyboardInterrupt, SystemExit):
+    finally:
+        # This is GUARANTEED to run, releasing the GPIO pins safely
         clean_and_exit()
