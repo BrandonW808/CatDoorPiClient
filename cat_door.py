@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 ChunkPreventionSystem — Cat Door Controller with Remote Server Integration
-Supports: remote lock/unlock, live weight, OTA updates, remote weight-range config.
 """
 
 import time
@@ -13,12 +12,10 @@ from datetime import datetime
 import RPi.GPIO as GPIO
 from hx711 import HX711
 
-import updater
-import config_store
-
 # ── Optional: Socket.IO for server connectivity ──────────
 try:
     import socketio
+
     SOCKET_ENABLED = True
 except ImportError:
     SOCKET_ENABLED = False
@@ -36,47 +33,38 @@ class Mode(Enum):
 
 
 # Server
-SERVER_URL        = "http://192.168.2.10:3001"
-DEVICE_API_KEY    = "catdoor-device-secret-key"
-DEVICE_ID         = "catdoor-1"
+SERVER_URL = "http://192.168.2.10:3001"          # ← change this
+DEVICE_API_KEY = "catdoor-device-secret-key"     # ← must match server .env
+DEVICE_ID = "catdoor-1"
 
 # Hardware pins
-LOCK_RELAY  = 23
+LOCK_RELAY = 23
 DOOR_SENSOR = 17
-HX711_DT    = 5
-HX711_SCK   = 6
+HX711_DT = 5
+HX711_SCK = 6
 REFERENCE_UNIT = 24.98
 
-# Behaviour (defaults — overridden by local_config.json)
+# Behaviour
 MODE = Mode.Standard
-UNLOCK_TIME              = 10
-STATE_CHANGE_DEBOUNCE    = 2        # seconds
-VALID_READ_MIN_SECONDS   = 0        # seconds
-STATUS_INTERVAL          = 1.0      # seconds between status pushes
-
-# ── Load persistent config ────────────────────────────────
-_cfg        = config_store.load()
-MIN_WEIGHT  = _cfg["min_weight"]
-MAX_WEIGHT  = _cfg["max_weight"]
-AUTO_UPDATE = _cfg.get("auto_update", True)
-UPDATE_CHECK_INTERVAL = _cfg.get("update_check_interval", 1800)
-
-# ── Version ───────────────────────────────────────────────
-CURRENT_VERSION = updater.get_git_version()
+MIN_WEIGHT = -3100
+MAX_WEIGHT = -4600
+UNLOCK_TIME = 10
+STATE_CHANGE_DEBOUNCE = 2        # seconds
+VALID_READ_MIN_SECONDS = 0       # seconds
+STATUS_INTERVAL = 1.0            # how often to push status to server
 
 
 # ═══════════════════════════════════════════════════════════
 #  GLOBAL STATE
 # ═══════════════════════════════════════════════════════════
-door_open       = False
-valid           = False
+door_open = False
+valid = False
 current_weight: float = 0.0
-lock_timer:  threading.Timer | None = None
+lock_timer: threading.Timer | None = None
 close_timer: threading.Timer | None = None
-lid_open        = False
-update_available = False
+lid_open = False                    # legacy flag (kept for parity)
 validity_change_time = datetime.now()
-state_change_time    = datetime.now()
+state_change_time = datetime.now()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -94,8 +82,7 @@ if SOCKET_ENABLED:
     def _on_connect():
         print("✅ Connected to server")
         send_status()
-        log_event("device_connected",
-                  f"Device {DEVICE_ID} connected  (v{CURRENT_VERSION})")
+        log_event("device_connected", f"Device {DEVICE_ID} connected")
 
     @sio.on("disconnect", namespace="/device")
     def _on_disconnect():
@@ -110,6 +97,7 @@ if SOCKET_ENABLED:
 #  HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════
 def safe_emit(event: str, data: dict):
+    """Emit a Socket.IO event; no-op when offline."""
     if not SOCKET_ENABLED:
         return
     try:
@@ -120,33 +108,31 @@ def safe_emit(event: str, data: dict):
 
 
 def log_event(event_type: str, message: str, data: dict | None = None):
+    """Print locally + push to server."""
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [{event_type}] {message}")
     safe_emit("log", {
         "eventType": event_type,
-        "message":   message,
-        "data":      data or {},
+        "message": message,
+        "data": data or {},
     })
 
 
 def send_status():
+    """Push current device state to the server."""
     safe_emit("status_update", {
-        "locked":           not GPIO.input(LOCK_RELAY),
-        "doorOpen":         door_open,
-        "weight":           current_weight,
-        "valid":            valid,
-        "mode":             MODE.value,
-        "minWeight":        MIN_WEIGHT,
-        "maxWeight":        MAX_WEIGHT,
-        "version":          CURRENT_VERSION,
-        "updateAvailable":  update_available,
+        "locked": not GPIO.input(LOCK_RELAY),
+        "doorOpen": door_open,
+        "weight": current_weight,
+        "valid": valid,
+        "mode": MODE.value,
+        "minWeight": MIN_WEIGHT,
+        "maxWeight": MAX_WEIGHT,
     })
 
 
-# ── Remote commands ───────────────────────────────────────
 def _handle_remote_command(data: dict):
-    global MIN_WEIGHT, MAX_WEIGHT, update_available
-
+    """Execute a lock/unlock command from the dashboard."""
     action = data.get("action")
     print(f"📡 Remote command: {action}")
 
@@ -154,7 +140,6 @@ def _handle_remote_command(data: dict):
         GPIO.output(LOCK_RELAY, True)
         log_event("unlocked", "Manual unlock via remote command")
         send_status()
-
     elif action == "lock":
         if not door_open:
             GPIO.output(LOCK_RELAY, False)
@@ -163,71 +148,9 @@ def _handle_remote_command(data: dict):
         else:
             log_event("error", "Cannot lock — door is open")
 
-    elif action == "check_update":
-        update_available = updater.check_for_updates()
-        msg = "Update available" if update_available else "Already up-to-date"
-        log_event("update_check", msg,
-                  {"updateAvailable": update_available,
-                   "version": CURRENT_VERSION})
-        send_status()
 
-    elif action == "trigger_update":
-        threading.Thread(target=_do_update_and_restart, daemon=True).start()
-
-    elif action == "set_weight_range":
-        new_min = data.get("minWeight")
-        new_max = data.get("maxWeight")
-        if new_min is not None:
-            MIN_WEIGHT = float(new_min)
-        if new_max is not None:
-            MAX_WEIGHT = float(new_max)
-        config_store.update({
-            "min_weight": MIN_WEIGHT,
-            "max_weight": MAX_WEIGHT,
-        })
-        log_event("config_changed",
-                  f"Weight range → {MAX_WEIGHT} … {MIN_WEIGHT}",
-                  {"minWeight": MIN_WEIGHT, "maxWeight": MAX_WEIGHT})
-        send_status()
-
-
-def _do_update_and_restart():
-    """Pull latest code + restart (runs in its own thread)."""
-    global update_available, CURRENT_VERSION
-
-    log_event("update_started", "Pulling latest code from GitHub …")
-    send_status()
-
-    if not updater.pull_latest():
-        log_event("update_failed", "Git pull failed")
-        send_status()
-        return
-
-    updater.install_requirements()
-
-    new_ver = updater.get_git_version()
-    log_event("update_complete",
-              f"Updated to {new_ver}. Restarting …",
-              {"oldVersion": CURRENT_VERSION, "newVersion": new_ver})
-    update_available = False
-    CURRENT_VERSION = new_ver
-    send_status()
-
-    time.sleep(3)                       # let socket.io flush
-
-    try:
-        hx.power_down()
-        GPIO.cleanup()
-        if SOCKET_ENABLED and sio.connected:
-            sio.disconnect()
-    except Exception:
-        pass
-
-    updater.restart_process()           # replaces the process
-
-
-# ── Server connection (background) ────────────────────────
 def connect_to_server():
+    """Background thread: keeps retrying until connected."""
     if not SOCKET_ENABLED:
         return
     while True:
@@ -238,28 +161,10 @@ def connect_to_server():
                 namespaces=["/device"],
                 auth={"apiKey": DEVICE_API_KEY, "deviceId": DEVICE_ID},
             )
-            break
+            break                       # connected — socketio handles reconnection from here
         except Exception as exc:
-            print(f"Connection failed: {exc}  — retrying in 10 s …")
+            print(f"Connection failed: {exc}  — retrying in 10 s…")
             time.sleep(10)
-
-
-# ── Auto-update loop (background) ─────────────────────────
-def auto_update_loop():
-    global update_available
-    time.sleep(60)                      # let the system settle after boot
-    while True:
-        try:
-            update_available = updater.check_for_updates()
-            if update_available:
-                log_event("update_available", "New version available on remote")
-                send_status()
-                if AUTO_UPDATE:
-                    _do_update_and_restart()
-            # If no update, just continue
-        except Exception as exc:
-            print(f"Auto-update error: {exc}")
-        time.sleep(UPDATE_CHECK_INTERVAL)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -276,7 +181,8 @@ GPIO.output(LOCK_RELAY, False)          # start locked
 # ═══════════════════════════════════════════════════════════
 def unlock():
     global lock_timer
-    if not GPIO.input(LOCK_RELAY):
+    current_state = GPIO.input(LOCK_RELAY)
+    if not current_state:                       # only if currently locked
         GPIO.output(LOCK_RELAY, True)
         log_event("unlocked", "Unlocked (auto — cat detected)")
         send_status()
@@ -303,7 +209,9 @@ def lock():
 # ═══════════════════════════════════════════════════════════
 def read_sensor(channel):
     global door_open, close_timer
+
     if GPIO.input(channel):
+        # Door OPENED
         door_open = True
         log_event("door_opened", "Door opened 🚪")
         send_status()
@@ -311,6 +219,7 @@ def read_sensor(channel):
             close_timer.cancel()
             close_timer = None
     else:
+        # Door CLOSED
         door_open = False
         log_event("door_closed", "Door closed 🔒")
         send_status()
@@ -318,11 +227,19 @@ def read_sensor(channel):
         close_timer.start()
 
 
-GPIO.add_event_detect(
-    DOOR_SENSOR, GPIO.BOTH,
-    callback=read_sensor, bouncetime=500,
-)
-
+try:
+    GPIO.add_event_detect(
+        DOOR_SENSOR,
+        GPIO.BOTH,
+        callback=read_sensor,
+        bouncetime=500,
+    )
+except RuntimeError as e:
+    # This uses your existing function to log locally and send to Socket.IO
+    log_event("error", f"Failed to add edge detection: {e}")
+    
+    # You can also add a standard print statement just in case
+    print(f"⚠️  GPIO Warning: Could not register door sensor. Error: {e}")
 
 # ═══════════════════════════════════════════════════════════
 #  HX711 (SCALE)
@@ -354,10 +271,8 @@ def clean_and_exit():
 # ═══════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════════
-print(f"🐱 ChunkPreventionSystem v{CURRENT_VERSION}  [{MODE.value} mode]")
-
+print(f"🐱 ChunkPreventionSystem booting in {MODE.value} mode")
 threading.Thread(target=connect_to_server, daemon=True).start()
-threading.Thread(target=auto_update_loop, daemon=True).start()
 
 last_status_time = time.time()
 
@@ -387,8 +302,7 @@ while True:
                             unlock()
                         if not valid:
                             validity_change_time = datetime.now()
-                            log_event("cat_detected",
-                                      f"Cat detected (weight: {val:.0f})")
+                            log_event("cat_detected", f"Cat detected (weight: {val:.0f})")
                         valid = True
                 else:
                     if valid:
