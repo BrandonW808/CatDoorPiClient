@@ -77,7 +77,7 @@ lid_open        = False
 update_available = False
 validity_change_time = datetime.now()
 state_change_time    = datetime.now()
-
+shutdown_event       = threading.Event()          # ← NEW
 
 # ═══════════════════════════════════════════════════════════
 #  SOCKET.IO SETUP
@@ -164,6 +164,7 @@ def _handle_remote_command(data: dict):
             log_event("error", "Cannot lock — door is open")
 
     elif action == "check_update":
+        log_event("update_checking", "Checking for updates…")   # ← NEW
         update_available = updater.check_for_updates()
         msg = "Update available" if update_available else "Already up-to-date"
         log_event("update_check", msg,
@@ -213,17 +214,23 @@ def _do_update_and_restart():
     CURRENT_VERSION = new_ver
     send_status()
 
-    time.sleep(3)                       # let socket.io flush
+    time.sleep(2)                           # let the socket flush
 
-    try:
-        hx.power_down()
-        GPIO.cleanup()
-        if SOCKET_ENABLED and sio.connected:
-            sio.disconnect()
-    except Exception:
-        pass
+    # ── Stop the main loop FIRST, then clean up ──────────
+    shutdown_event.set()
+    time.sleep(1)                           # wait for the loop to break
 
-    updater.restart_process()           # replaces the process
+    for fn in [
+        lambda: hx.power_down(),
+        GPIO.cleanup,
+        lambda: sio.disconnect() if SOCKET_ENABLED and sio.connected else None,
+    ]:
+        try:
+            fn()
+        except Exception:
+            pass
+
+    updater.restart_process()               # replaces the process
 
 
 # ── Server connection (background) ────────────────────────
@@ -350,11 +357,17 @@ print("Tare done — add weight now.")
 #  CLEANUP
 # ═══════════════════════════════════════════════════════════
 def clean_and_exit():
-    hx.power_down()
+    shutdown_event.set()
     print("Cleaning up …")
-    GPIO.cleanup()
-    if SOCKET_ENABLED and sio.connected:
-        sio.disconnect()
+    for fn in [
+        lambda: hx.power_down(),
+        GPIO.cleanup,
+        lambda: sio.disconnect() if SOCKET_ENABLED and sio.connected else None,
+    ]:
+        try:
+            fn()
+        except Exception:
+            pass
     print("Bye!")
     sys.exit()
 
@@ -369,7 +382,7 @@ threading.Thread(target=auto_update_loop, daemon=True).start()
 
 last_status_time = time.time()
 
-while True:
+while not shutdown_event.is_set():                    # ← was `while True`
     now = datetime.now()
     try:
         val = hx.get_weight(3)
@@ -411,5 +424,17 @@ while True:
             send_status()
             last_status_time = now_t
 
+    except RuntimeError:                              # ← NEW
+        if shutdown_event.is_set():
+            break                                     # GPIO cleaned up — exit gracefully
+        raise                                         # unrelated error — re-raise
+
     except (KeyboardInterrupt, SystemExit):
         clean_and_exit()
+
+# ── Landed here because shutdown_event was set (update restart) ──
+if shutdown_event.is_set():
+    print("⏳ Main loop stopped — waiting for process restart …")
+    time.sleep(30)          # os.execv will replace us well before this expires
+    print("⚠️  Restart didn't happen — exiting.")
+    sys.exit(1)
