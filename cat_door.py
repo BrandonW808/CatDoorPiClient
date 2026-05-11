@@ -36,7 +36,7 @@ class Mode(Enum):
 
 
 # Server
-SERVER_URL        = "http://192.168.2.10:3001"
+SERVER_URL        = "http://192.168.1.91:3001"
 DEVICE_API_KEY    = "catdoor-device-secret-key"
 DEVICE_ID         = "catdoor-1"
 
