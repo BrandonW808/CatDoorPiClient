@@ -164,6 +164,7 @@ def _handle_remote_command(data: dict):
             log_event("error", "Cannot lock — door is open")
 
     elif action == "check_update":
+        log_event("update_checking", "Checking for updates…")   # ← NEW
         update_available = updater.check_for_updates()
         msg = "Update available" if update_available else "Already up-to-date"
         log_event("update_check", msg,
