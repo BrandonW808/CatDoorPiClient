@@ -77,7 +77,7 @@ lid_open        = False
 update_available = False
 validity_change_time = datetime.now()
 state_change_time    = datetime.now()
-
+shutdown_event       = threading.Event()
 
 # ═══════════════════════════════════════════════════════════
 #  SOCKET.IO SETUP
@@ -214,7 +214,11 @@ def _do_update_and_restart():
     CURRENT_VERSION = new_ver
     send_status()
 
-    time.sleep(3)                       # let socket.io flush
+    time.sleep(3)                           # let socket.io flush
+
+    # ── Stop the main loop BEFORE touching GPIO ──────────
+    shutdown_event.set()                    # ← NEW: main loop sees this
+    time.sleep(2)                           # ← NEW: wait for it to exit
 
     try:
         hx.power_down()
@@ -224,7 +228,7 @@ def _do_update_and_restart():
     except Exception:
         pass
 
-    updater.restart_process()           # replaces the process
+    updater.restart_process()               # replaces the process
 
 
 # ── Server connection (background) ────────────────────────
@@ -351,11 +355,21 @@ print("Tare done — add weight now.")
 #  CLEANUP
 # ═══════════════════════════════════════════════════════════
 def clean_and_exit():
-    hx.power_down()
     print("Cleaning up …")
-    GPIO.cleanup()
-    if SOCKET_ENABLED and sio.connected:
-        sio.disconnect()
+    try:
+        hx.power_down()
+    except Exception:
+        pass
+    try:
+        GPIO.cleanup()
+    except Exception:
+        pass
+    if SOCKET_ENABLED:
+        try:
+            if sio.connected:
+                sio.disconnect()
+        except Exception:
+            pass
     print("Bye!")
     sys.exit()
 
@@ -370,7 +384,7 @@ threading.Thread(target=auto_update_loop, daemon=True).start()
 
 last_status_time = time.time()
 
-while True:
+while not shutdown_event.is_set():                  # ← was `while True`
     now = datetime.now()
     try:
         val = hx.get_weight(3)
@@ -414,3 +428,13 @@ while True:
 
     except (KeyboardInterrupt, SystemExit):
         clean_and_exit()
+
+# ── If we land here, a restart is pending ─────────────────
+# Keep the main thread alive so the daemon update-thread
+# can finish cleanup and call os.execv().
+print("⏳ Main loop stopped — waiting for process restart …")
+try:
+    while True:
+        time.sleep(1)
+except (KeyboardInterrupt, SystemExit):
+    clean_and_exit()
