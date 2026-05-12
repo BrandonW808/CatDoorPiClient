@@ -77,7 +77,7 @@ lid_open        = False
 update_available = False
 validity_change_time = datetime.now()
 state_change_time    = datetime.now()
-shutdown_event       = threading.Event()
+shutdown_event       = threading.Event()          # ← NEW
 
 # ═══════════════════════════════════════════════════════════
 #  SOCKET.IO SETUP
@@ -214,19 +214,21 @@ def _do_update_and_restart():
     CURRENT_VERSION = new_ver
     send_status()
 
-    time.sleep(3)                           # let socket.io flush
+    time.sleep(2)                           # let the socket flush
 
-    # ── Stop the main loop BEFORE touching GPIO ──────────
-    shutdown_event.set()                    # ← NEW: main loop sees this
-    time.sleep(2)                           # ← NEW: wait for it to exit
+    # ── Stop the main loop FIRST, then clean up ──────────
+    shutdown_event.set()
+    time.sleep(1)                           # wait for the loop to break
 
-    try:
-        hx.power_down()
-        GPIO.cleanup()
-        if SOCKET_ENABLED and sio.connected:
-            sio.disconnect()
-    except Exception:
-        pass
+    for fn in [
+        lambda: hx.power_down(),
+        GPIO.cleanup,
+        lambda: sio.disconnect() if SOCKET_ENABLED and sio.connected else None,
+    ]:
+        try:
+            fn()
+        except Exception:
+            pass
 
     updater.restart_process()               # replaces the process
 
@@ -355,19 +357,15 @@ print("Tare done — add weight now.")
 #  CLEANUP
 # ═══════════════════════════════════════════════════════════
 def clean_and_exit():
+    shutdown_event.set()
     print("Cleaning up …")
-    try:
-        hx.power_down()
-    except Exception:
-        pass
-    try:
-        GPIO.cleanup()
-    except Exception:
-        pass
-    if SOCKET_ENABLED:
+    for fn in [
+        lambda: hx.power_down(),
+        GPIO.cleanup,
+        lambda: sio.disconnect() if SOCKET_ENABLED and sio.connected else None,
+    ]:
         try:
-            if sio.connected:
-                sio.disconnect()
+            fn()
         except Exception:
             pass
     print("Bye!")
@@ -384,7 +382,7 @@ threading.Thread(target=auto_update_loop, daemon=True).start()
 
 last_status_time = time.time()
 
-while not shutdown_event.is_set():                  # ← was `while True`
+while not shutdown_event.is_set():                    # ← was `while True`
     now = datetime.now()
     try:
         val = hx.get_weight(3)
@@ -426,15 +424,17 @@ while not shutdown_event.is_set():                  # ← was `while True`
             send_status()
             last_status_time = now_t
 
+    except RuntimeError:                              # ← NEW
+        if shutdown_event.is_set():
+            break                                     # GPIO cleaned up — exit gracefully
+        raise                                         # unrelated error — re-raise
+
     except (KeyboardInterrupt, SystemExit):
         clean_and_exit()
 
-# ── If we land here, a restart is pending ─────────────────
-# Keep the main thread alive so the daemon update-thread
-# can finish cleanup and call os.execv().
-print("⏳ Main loop stopped — waiting for process restart …")
-try:
-    while True:
-        time.sleep(1)
-except (KeyboardInterrupt, SystemExit):
-    clean_and_exit()
+# ── Landed here because shutdown_event was set (update restart) ──
+if shutdown_event.is_set():
+    print("⏳ Main loop stopped — waiting for process restart …")
+    time.sleep(30)          # os.execv will replace us well before this expires
+    print("⚠️  Restart didn't happen — exiting.")
+    sys.exit(1)
