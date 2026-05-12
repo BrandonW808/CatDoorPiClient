@@ -7,6 +7,8 @@ Supports: remote lock/unlock, live weight, OTA updates, remote weight-range conf
 import time
 import sys
 import threading
+import statistics
+from collections import deque
 from enum import Enum
 from datetime import datetime
 
@@ -16,9 +18,6 @@ from hx711 import HX711
 import updater
 import config_store
 
-import collections
-import statistics
-
 # ── Optional: Socket.IO for server connectivity ──────────
 try:
     import socketio
@@ -27,6 +26,40 @@ except ImportError:
     SOCKET_ENABLED = False
     print("⚠️  python-socketio not installed — running in offline mode")
     print("   Install with:  pip install 'python-socketio[client]'")
+
+
+# ═══════════════════════════════════════════════════════════
+#  WEIGHT SMOOTHER
+# ═══════════════════════════════════════════════════════════
+class WeightSmoother:
+    """
+    Rolling median + trimmed-mean filter.
+
+    Each call to .add(raw) appends to a fixed-size ring buffer.
+    The smoothed value is the mean of all samples within 15 %
+    (or 50 g, whichever is larger) of the window's median —
+    this rejects transient spikes without adding lag.
+    """
+
+    def __init__(self, window_size: int = 10):
+        self._buf: deque[float] = deque(maxlen=window_size)
+
+    def add(self, raw: float) -> float:
+        self._buf.append(raw)
+        if len(self._buf) < 3:
+            return raw
+
+        med = statistics.median(self._buf)
+        threshold = max(abs(med) * 0.15, 50)          # 15 % or 50 g
+        close = [v for v in self._buf if abs(v - med) <= threshold]
+        return statistics.mean(close) if close else med
+
+    def clear(self):
+        self._buf.clear()
+
+    @property
+    def count(self) -> int:
+        return len(self._buf)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -57,13 +90,11 @@ STATE_CHANGE_DEBOUNCE    = 2        # seconds
 VALID_READ_MIN_SECONDS   = 0        # seconds
 STATUS_INTERVAL          = 1.0      # seconds between status pushes
 
-# ── Scale tuning ──────────────────────────────────────────
-RAW_SAMPLES          = 5        # samples per hx.get_weight() call
-SMOOTHING_WINDOW     = 10       # rolling buffer length
-OUTLIER_MAX_DEV      = 500      # reject reads this far from the median
-DEAD_ZONE            = 30       # abs(weight) below this → snap to 0
-AUTO_TARE_THRESHOLD  = 50       # auto-tare when abs(weight) < this …
-AUTO_TARE_HOLD_SECS  = 15       # … for this many consecutive seconds
+# Scale smoothing / tare
+SAMPLES_PER_READ      = 5           # HX711 internal average per read
+SMOOTHING_WINDOW      = 10          # rolling-filter depth
+AUTO_TARE_THRESHOLD   = 50          # grams — abs(smoothed) below this is "empty"
+AUTO_TARE_HOLD_SECS   = 10          # seconds the scale must stay "empty"
 
 # ── Load persistent config ────────────────────────────────
 _cfg        = config_store.load()
@@ -82,15 +113,19 @@ CURRENT_VERSION = updater.get_git_version()
 door_open       = False
 valid           = False
 current_weight: float = 0.0
+raw_weight:     float = 0.0
 lock_timer:  threading.Timer | None = None
 close_timer: threading.Timer | None = None
 lid_open        = False
 update_available = False
 validity_change_time = datetime.now()
 state_change_time    = datetime.now()
-shutdown_event       = threading.Event()          # ← NEW
-weight_buffer: collections.deque[float] = collections.deque(maxlen=SMOOTHING_WINDOW)
-near_zero_since: float | None = None
+shutdown_event       = threading.Event()
+tare_event           = threading.Event()   # set by remote cmd, consumed by main loop
+
+smoother = WeightSmoother(SMOOTHING_WINDOW)
+_near_zero_since: float | None = None      # for auto-tare timing
+
 
 # ═══════════════════════════════════════════════════════════
 #  SOCKET.IO SETUP
@@ -147,6 +182,7 @@ def send_status():
         "locked":           not GPIO.input(LOCK_RELAY),
         "doorOpen":         door_open,
         "weight":           current_weight,
+        "rawWeight":        raw_weight,
         "valid":            valid,
         "mode":             MODE.value,
         "minWeight":        MIN_WEIGHT,
@@ -154,6 +190,40 @@ def send_status():
         "version":          CURRENT_VERSION,
         "updateAvailable":  update_available,
     })
+
+
+# ── Tare helpers ──────────────────────────────────────────
+def do_tare(reason: str = "manual"):
+    """Zero the scale.  Must be called from the main (HX711) thread."""
+    global current_weight, raw_weight, _near_zero_since
+
+    log_event("tare_started", f"Taring scale ({reason}) …")
+    smoother.clear()
+    _near_zero_since = None
+    hx.reset()
+    hx.tare()
+    current_weight = 0.0
+    raw_weight = 0.0
+    log_event("tare_complete", f"Scale tared ({reason})")
+    send_status()
+
+
+def maybe_auto_tare(smoothed: float):
+    """Re-tare when the scale sits near zero for AUTO_TARE_HOLD_SECS."""
+    global _near_zero_since
+
+    # Don't auto-tare while a cat is detected or the door is in use
+    if valid or door_open:
+        _near_zero_since = None
+        return
+
+    if abs(smoothed) < AUTO_TARE_THRESHOLD:
+        if _near_zero_since is None:
+            _near_zero_since = time.time()
+        elif time.time() - _near_zero_since >= AUTO_TARE_HOLD_SECS:
+            do_tare("auto — drift correction")
+    else:
+        _near_zero_since = None
 
 
 # ── Remote commands ───────────────────────────────────────
@@ -176,8 +246,12 @@ def _handle_remote_command(data: dict):
         else:
             log_event("error", "Cannot lock — door is open")
 
+    elif action == "tare":
+        # Signal the main loop to tare (HX711 must be accessed from one thread)
+        tare_event.set()
+
     elif action == "check_update":
-        log_event("update_checking", "Checking for updates…")   # ← NEW
+        log_event("update_checking", "Checking for updates…")
         update_available = updater.check_for_updates()
         msg = "Update available" if update_available else "Already up-to-date"
         log_event("update_check", msg,
@@ -203,8 +277,6 @@ def _handle_remote_command(data: dict):
                   f"Weight range → {MAX_WEIGHT} … {MIN_WEIGHT}",
                   {"minWeight": MIN_WEIGHT, "maxWeight": MAX_WEIGHT})
         send_status()
-    elif action == "tare":
-        threading.Thread(target=do_tare, daemon=True).start()
 
 
 def _do_update_and_restart():
@@ -229,11 +301,10 @@ def _do_update_and_restart():
     CURRENT_VERSION = new_ver
     send_status()
 
-    time.sleep(2)                           # let the socket flush
+    time.sleep(2)
 
-    # ── Stop the main loop FIRST, then clean up ──────────
     shutdown_event.set()
-    time.sleep(1)                           # wait for the loop to break
+    time.sleep(1)
 
     for fn in [
         lambda: hx.power_down(),
@@ -245,7 +316,7 @@ def _do_update_and_restart():
         except Exception:
             pass
 
-    updater.restart_process()               # replaces the process
+    updater.restart_process()
 
 
 # ── Server connection (background) ────────────────────────
@@ -269,7 +340,7 @@ def connect_to_server():
 # ── Auto-update loop (background) ─────────────────────────
 def auto_update_loop():
     global update_available
-    time.sleep(60)                      # let the system settle after boot
+    time.sleep(60)
     while True:
         try:
             update_available = updater.check_for_updates()
@@ -278,61 +349,10 @@ def auto_update_loop():
                 send_status()
                 if AUTO_UPDATE:
                     _do_update_and_restart()
-            # If no update, just continue
         except Exception as exc:
             print(f"Auto-update error: {exc}")
         time.sleep(UPDATE_CHECK_INTERVAL)
 
-# ── Scale helpers ─────────────────────────────────────────
-def get_smoothed_weight() -> float:
-    """Read the HX711, reject outliers, return a moving-median weight."""
-    raw = hx.get_weight(RAW_SAMPLES)
-
-    # Power-cycling the ADC between reads reduces drift / noise
-    hx.power_down()
-    time.sleep(0.01)
-    hx.power_up()
-    time.sleep(0.01)
-
-    weight_buffer.append(raw)
-
-    if len(weight_buffer) < 3:
-        return round(raw, 1)
-
-    med = statistics.median(weight_buffer)
-    good = [w for w in weight_buffer if abs(w - med) <= OUTLIER_MAX_DEV]
-    smoothed = statistics.mean(good) if good else med
-
-    if abs(smoothed) < DEAD_ZONE:
-        smoothed = 0.0
-
-    return round(smoothed, 1)
-
-
-def do_tare():
-    """Zero the scale and clear the smoothing buffer."""
-    global near_zero_since
-    weight_buffer.clear()
-    near_zero_since = None
-    hx.reset()
-    hx.tare()
-    log_event("tare", "Scale tared (zeroed)")
-    send_status()
-
-
-def maybe_auto_tare():
-    """Re-tare when the scale has been idle near zero long enough."""
-    global near_zero_since
-    now_t = time.time()
-
-    if abs(current_weight) < AUTO_TARE_THRESHOLD and not valid and not door_open:
-        if near_zero_since is None:
-            near_zero_since = now_t
-        elif (now_t - near_zero_since) >= AUTO_TARE_HOLD_SECS:
-            log_event("auto_tare", "Auto-tare triggered (idle near zero)")
-            do_tare()
-    else:
-        near_zero_since = None
 
 # ═══════════════════════════════════════════════════════════
 #  GPIO SETUP
@@ -340,7 +360,7 @@ def maybe_auto_tare():
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(DOOR_SENSOR, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(LOCK_RELAY, GPIO.OUT)
-GPIO.output(LOCK_RELAY, False)          # start locked
+GPIO.output(LOCK_RELAY, False)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -398,11 +418,9 @@ try:
         bouncetime=500,
     )
 except RuntimeError as e:
-    # This uses your existing function to log locally and send to Socket.IO
     log_event("error", f"Failed to add edge detection: {e}")
-    
-    # You can also add a standard print statement just in case
     print(f"⚠️  GPIO Warning: Could not register door sensor. Error: {e}")
+
 
 # ═══════════════════════════════════════════════════════════
 #  HX711 (SCALE)
@@ -447,11 +465,23 @@ threading.Thread(target=auto_update_loop, daemon=True).start()
 
 last_status_time = time.time()
 
-while not shutdown_event.is_set():                    # ← was `while True`
+while not shutdown_event.is_set():
     now = datetime.now()
     try:
-        current_weight = get_smoothed_weight()
-        val = current_weight
+        # ── Handle pending tare request (must stay on this thread) ──
+        if tare_event.is_set():
+            tare_event.clear()
+            do_tare("remote command")
+            continue
+
+        # ── Read + smooth weight ──
+        raw = hx.get_weight(SAMPLES_PER_READ)
+        raw_weight = raw
+        val = smoother.add(raw)
+        current_weight = round(val, 1)
+
+        # ── Auto-tare when scale is idle near zero ──
+        maybe_auto_tare(val)
 
         if MODE == Mode.Training:
             if (now - state_change_time).total_seconds() > STATE_CHANGE_DEBOUNCE:
@@ -488,21 +518,17 @@ while not shutdown_event.is_set():                    # ← was `while True`
         if now_t - last_status_time >= STATUS_INTERVAL:
             send_status()
             last_status_time = now_t
-        # ── Auto-tare when idle near zero ──
-        maybe_auto_tare()
 
-        time.sleep(0.05)
-    except RuntimeError:                              # ← NEW
+    except RuntimeError:
         if shutdown_event.is_set():
-            break                                     # GPIO cleaned up — exit gracefully
-        raise                                         # unrelated error — re-raise
+            break
+        raise
 
     except (KeyboardInterrupt, SystemExit):
         clean_and_exit()
 
-# ── Landed here because shutdown_event was set (update restart) ──
 if shutdown_event.is_set():
     print("⏳ Main loop stopped — waiting for process restart …")
-    time.sleep(30)          # os.execv will replace us well before this expires
+    time.sleep(30)
     print("⚠️  Restart didn't happen — exiting.")
     sys.exit(1)
