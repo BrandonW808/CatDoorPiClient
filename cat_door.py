@@ -16,6 +16,9 @@ from hx711 import HX711
 import updater
 import config_store
 
+import collections
+import statistics
+
 # ── Optional: Socket.IO for server connectivity ──────────
 try:
     import socketio
@@ -54,6 +57,14 @@ STATE_CHANGE_DEBOUNCE    = 2        # seconds
 VALID_READ_MIN_SECONDS   = 0        # seconds
 STATUS_INTERVAL          = 1.0      # seconds between status pushes
 
+# ── Scale tuning ──────────────────────────────────────────
+RAW_SAMPLES          = 5        # samples per hx.get_weight() call
+SMOOTHING_WINDOW     = 10       # rolling buffer length
+OUTLIER_MAX_DEV      = 500      # reject reads this far from the median
+DEAD_ZONE            = 30       # abs(weight) below this → snap to 0
+AUTO_TARE_THRESHOLD  = 50       # auto-tare when abs(weight) < this …
+AUTO_TARE_HOLD_SECS  = 15       # … for this many consecutive seconds
+
 # ── Load persistent config ────────────────────────────────
 _cfg        = config_store.load()
 MIN_WEIGHT  = _cfg["min_weight"]
@@ -78,6 +89,8 @@ update_available = False
 validity_change_time = datetime.now()
 state_change_time    = datetime.now()
 shutdown_event       = threading.Event()          # ← NEW
+weight_buffer: collections.deque[float] = collections.deque(maxlen=SMOOTHING_WINDOW)
+near_zero_since: float | None = None
 
 # ═══════════════════════════════════════════════════════════
 #  SOCKET.IO SETUP
@@ -190,6 +203,8 @@ def _handle_remote_command(data: dict):
                   f"Weight range → {MAX_WEIGHT} … {MIN_WEIGHT}",
                   {"minWeight": MIN_WEIGHT, "maxWeight": MAX_WEIGHT})
         send_status()
+    elif action == "tare":
+        threading.Thread(target=do_tare, daemon=True).start()
 
 
 def _do_update_and_restart():
@@ -268,6 +283,56 @@ def auto_update_loop():
             print(f"Auto-update error: {exc}")
         time.sleep(UPDATE_CHECK_INTERVAL)
 
+# ── Scale helpers ─────────────────────────────────────────
+def get_smoothed_weight() -> float:
+    """Read the HX711, reject outliers, return a moving-median weight."""
+    raw = hx.get_weight(RAW_SAMPLES)
+
+    # Power-cycling the ADC between reads reduces drift / noise
+    hx.power_down()
+    time.sleep(0.01)
+    hx.power_up()
+    time.sleep(0.01)
+
+    weight_buffer.append(raw)
+
+    if len(weight_buffer) < 3:
+        return round(raw, 1)
+
+    med = statistics.median(weight_buffer)
+    good = [w for w in weight_buffer if abs(w - med) <= OUTLIER_MAX_DEV]
+    smoothed = statistics.mean(good) if good else med
+
+    if abs(smoothed) < DEAD_ZONE:
+        smoothed = 0.0
+
+    return round(smoothed, 1)
+
+
+def do_tare():
+    """Zero the scale and clear the smoothing buffer."""
+    global near_zero_since
+    weight_buffer.clear()
+    near_zero_since = None
+    hx.reset()
+    hx.tare()
+    log_event("tare", "Scale tared (zeroed)")
+    send_status()
+
+
+def maybe_auto_tare():
+    """Re-tare when the scale has been idle near zero long enough."""
+    global near_zero_since
+    now_t = time.time()
+
+    if abs(current_weight) < AUTO_TARE_THRESHOLD and not valid and not door_open:
+        if near_zero_since is None:
+            near_zero_since = now_t
+        elif (now_t - near_zero_since) >= AUTO_TARE_HOLD_SECS:
+            log_event("auto_tare", "Auto-tare triggered (idle near zero)")
+            do_tare()
+    else:
+        near_zero_since = None
 
 # ═══════════════════════════════════════════════════════════
 #  GPIO SETUP
@@ -385,8 +450,8 @@ last_status_time = time.time()
 while not shutdown_event.is_set():                    # ← was `while True`
     now = datetime.now()
     try:
-        val = hx.get_weight(3)
-        current_weight = val
+        current_weight = get_smoothed_weight()
+        val = current_weight
 
         if MODE == Mode.Training:
             if (now - state_change_time).total_seconds() > STATE_CHANGE_DEBOUNCE:
@@ -423,7 +488,10 @@ while not shutdown_event.is_set():                    # ← was `while True`
         if now_t - last_status_time >= STATUS_INTERVAL:
             send_status()
             last_status_time = now_t
+        # ── Auto-tare when idle near zero ──
+        maybe_auto_tare()
 
+        time.sleep(0.05)
     except RuntimeError:                              # ← NEW
         if shutdown_event.is_set():
             break                                     # GPIO cleaned up — exit gracefully
