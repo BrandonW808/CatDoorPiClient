@@ -53,21 +53,16 @@ REFERENCE_UNIT = 24.98
 # Behaviour (defaults — overridden by local_config.json)
 MODE = Mode.Standard
 UNLOCK_TIME              = 10
-TRAINING_DEBOUNCE        = 2        # seconds (Training mode only)
+STATE_CHANGE_DEBOUNCE    = 0.5      # ← was 2 — reduced; confirmation window handles timing
+VALID_READ_MIN_SECONDS   = 2        # ← was 0 — cat must stay 2 s before unlock
 STATUS_INTERVAL          = 1.0      # seconds between status pushes
 
 # ── Scale tuning ──────────────────────────────────────────
-RAW_SAMPLES          = 1        # ← was 5: one sample per call (~100 ms at 10 SPS)
-SMOOTHING_WINDOW     = 5        # ← was 10: fills in ~0.5 s instead of ~5 s
+RAW_SAMPLES          = 1        # ← was 5 — single sample for speed (HX711 ≈ 10 Hz)
+SMOOTHING_WINDOW     = 5        # ← was 10 — tighter window, converges in ~0.5 s
 OUTLIER_MAX_DEV      = 500      # reject reads this far from the median
 DEAD_ZONE            = 30       # abs(weight) below this → snap to 0
-
-# ── Cat-detection timing ─────────────────────────────────
-VALID_HOLD_SECONDS   = 2.0      # weight must stay in range this long to unlock
-
-# ── Negative-weight auto-tare ────────────────────────────
-NEGATIVE_TARE_THRESHOLD = 50    # auto-tare when weight is below  –this
-NEGATIVE_TARE_HOLD_SECS = 5     # … for this many consecutive seconds
+NEGATIVE_TARE_SECS   = 5        # ← replaces AUTO_TARE_HOLD_SECS / AUTO_TARE_THRESHOLD
 
 # ── Load persistent config ────────────────────────────────
 _cfg        = config_store.load()
@@ -90,11 +85,11 @@ lock_timer:  threading.Timer | None = None
 close_timer: threading.Timer | None = None
 lid_open        = False
 update_available = False
-validity_start_time: float = 0.0          # ← time.time() when weight first entered valid range
-state_change_time    = datetime.now()     # Training mode only
+validity_change_time = datetime.now()
+state_change_time    = datetime.now()
 shutdown_event       = threading.Event()
 weight_buffer: collections.deque[float] = collections.deque(maxlen=SMOOTHING_WINDOW)
-negative_since: float | None = None       # ← renamed from near_zero_since
+negative_since: float | None = None                   # ← renamed from near_zero_since
 
 # ═══════════════════════════════════════════════════════════
 #  SOCKET.IO SETUP
@@ -287,17 +282,12 @@ def auto_update_loop():
 
 # ── Scale helpers ─────────────────────────────────────────
 def get_smoothed_weight() -> float:
-    """
-    Read one sample from the HX711, feed it into a small rolling buffer,
-    and return the outlier-trimmed mean.
-
-    With RAW_SAMPLES=1 each call blocks for only ~100 ms (at 10 SPS),
-    so the buffer fills in ≈0.5 s and reacts to a new cat almost
-    immediately.
-    """
+    """Read the HX711, reject outliers, return a moving-median weight."""
     raw = hx.get_weight(RAW_SAMPLES)
-    # No power-cycling here — it added ≥20 ms of dead time per read
-    # and was the biggest contributor to perceived lag.
+
+    # ── power-cycle REMOVED ──────────────────────────────
+    # Eliminating the power_down / power_up / sleep saves ~20 ms per
+    # loop and lets us read at the full HX711 sample rate (~10 Hz).
 
     weight_buffer.append(raw)
 
@@ -319,10 +309,6 @@ def do_tare():
     global negative_since
     weight_buffer.clear()
     negative_since = None
-    hx.power_down()
-    time.sleep(0.01)
-    hx.power_up()
-    time.sleep(0.01)
     hx.reset()
     hx.tare()
     log_event("tare", "Scale tared (zeroed)")
@@ -330,22 +316,21 @@ def do_tare():
 
 
 def maybe_auto_tare():
-    """
-    Re-tare ONLY when the scale has been reading a sustained negative
-    weight — this means something was sitting on the platform at boot
-    and has since been removed, leaving a negative offset.
+    """Re-tare only when the scale reads negative for a sustained period.
 
-    Does NOT tare when idle near zero (that was causing nuisance tares).
+    A negative reading means something was sitting on the platform at
+    boot (when tare ran) and has since been removed.  All other cases
+    (idle at zero, small positive drift) are left alone.
     """
     global negative_since
     now_t = time.time()
 
-    if current_weight < -NEGATIVE_TARE_THRESHOLD and not valid and not door_open:
+    if current_weight < 0 and not valid and not door_open:
         if negative_since is None:
             negative_since = now_t
-        elif (now_t - negative_since) >= NEGATIVE_TARE_HOLD_SECS:
+        elif (now_t - negative_since) >= NEGATIVE_TARE_SECS:
             log_event("auto_tare",
-                      f"Auto-tare triggered (sustained negative: {current_weight:.0f} g)")
+                      f"Auto-tare triggered (negative drift: {current_weight:.0f} g)")
             do_tare()
     else:
         negative_since = None
@@ -363,15 +348,26 @@ GPIO.output(LOCK_RELAY, False)          # start locked
 #  LOCK / UNLOCK
 # ═══════════════════════════════════════════════════════════
 def unlock():
+    """Unlock the door and (re)start the auto-lock countdown.
+
+    The timer is restarted on *every* call so that it counts from the
+    last moment the cat was confirmed on the scale — giving the cat the
+    full UNLOCK_TIME window to push through the flap after stepping off.
+    """
     global lock_timer
-    if not GPIO.input(LOCK_RELAY):
+
+    # Always cancel the old timer first
+    if lock_timer is not None:
+        lock_timer.cancel()
+
+    if not GPIO.input(LOCK_RELAY):          # relay currently OFF → unlock
         GPIO.output(LOCK_RELAY, True)
         log_event("unlocked", "Unlocked (auto — cat detected)")
         send_status()
-        if lock_timer is not None:
-            lock_timer.cancel()
-        lock_timer = threading.Timer(UNLOCK_TIME, lock)
-        lock_timer.start()
+
+    # (Re)start the countdown — runs from the most recent valid reading
+    lock_timer = threading.Timer(UNLOCK_TIME, lock)
+    lock_timer.start()
 
 
 def lock():
@@ -467,7 +463,7 @@ while not shutdown_event.is_set():
         val = current_weight
 
         if MODE == Mode.Training:
-            if (now - state_change_time).total_seconds() > TRAINING_DEBOUNCE:
+            if (now - state_change_time).total_seconds() > STATE_CHANGE_DEBOUNCE:
                 if val < MAX_WEIGHT:
                     if lid_open:
                         state_change_time = datetime.now()
@@ -477,37 +473,38 @@ while not shutdown_event.is_set():
                         state_change_time = datetime.now()
                         unlock()
 
-        else:  # ── Standard mode ──────────────────────────
-            in_range = MAX_WEIGHT < val < MIN_WEIGHT
-
-            if in_range:
-                if not valid:
-                    # Cat just stepped on — start the hold timer
+        else:  # Standard mode
+            if (now - state_change_time).total_seconds() > STATE_CHANGE_DEBOUNCE:
+                if MAX_WEIGHT < val < MIN_WEIGHT:
+                    if not lid_open:
+                        if valid and (now - validity_change_time).total_seconds() > VALID_READ_MIN_SECONDS:
+                            state_change_time = datetime.now()
+                            unlock()
+                        if not valid:
+                            validity_change_time = datetime.now()
+                            log_event("cat_detected",
+                                      f"Cat detected (weight: {val:.0f})")
                     valid = True
-                    validity_start_time = time.time()
-                    log_event("cat_detected",
-                              f"Cat detected (weight: {val:.0f})")
                 else:
-                    # Still in range — unlock once the hold period has elapsed
-                    if (time.time() - validity_start_time) >= VALID_HOLD_SECONDS:
-                        unlock()          # idempotent: unlock() guards against double-fire
-            else:
-                if valid:
-                    # Cat left or weight drifted out of range
-                    valid = False
-                    log_event("cat_left", f"Cat left (weight: {val:.0f})")
-                    lock()
+                    if valid:
+                        state_change_time = datetime.now()
+                        valid = False
+                        log_event("cat_left", f"Cat left (weight: {val:.0f})")
+                        # ── lock() call REMOVED ──────────────────────
+                        # The lock_timer started by unlock() provides a
+                        # grace window (UNLOCK_TIME) for the cat to push
+                        # through the flap.  The door-close timer and
+                        # lock_timer handle re-locking automatically.
 
         # ── Periodic status push ──
         now_t = time.time()
         if now_t - last_status_time >= STATUS_INTERVAL:
             send_status()
             last_status_time = now_t
-
-        # ── Auto-tare on sustained negative weight only ──
+        # ── Auto-tare when weight is negative ──
         maybe_auto_tare()
 
-        time.sleep(0.005)                 # ← was 0.05; HX711 read already blocks ~100 ms
+        time.sleep(0.01)                              # ← was 0.05
 
     except RuntimeError:
         if shutdown_event.is_set():
