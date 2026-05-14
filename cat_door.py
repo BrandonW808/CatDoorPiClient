@@ -343,7 +343,7 @@ def maybe_auto_tare():
     if current_weight < -NEGATIVE_TARE_THRESHOLD and not valid and not door_open:
         if negative_since is None:
             negative_since = now_t
-        elif (now_t - negative_since) >= NEGATIVE_TARE_HOLD_SECS:
+        elif (now_t - negative_since) <= NEGATIVE_TARE_HOLD_SECS:
             log_event("auto_tare",
                       f"Auto-tare triggered (sustained negative: {current_weight:.0f} g)")
             do_tare()
